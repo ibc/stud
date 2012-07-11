@@ -82,6 +82,8 @@
 #endif
 #endif
 
+#define PEM_MAX_SIZE 2*1024
+
 /* Globals */
 static struct ev_loop *loop;
 static struct addrinfo *backaddr;
@@ -118,6 +120,7 @@ typedef struct stud_options {
     ENC_TYPE ETYPE;
     int WRITE_IP_OCTET;
     int WRITE_PROXY_LINE;
+    int WRITE_PEMS; // ibc
     const char* CHROOT;
     uid_t UID;
     gid_t GID;
@@ -149,6 +152,7 @@ static stud_options OPTIONS = {
     ENC_TLS,      // ETYPE
     0,            // WRITE_IP_OCTET
     0,            // WRITE_PROXY_LINE
+    0,            // WRITE_PEMS
     NULL,         // CHROOT
     0,            // UID
     0,            // GID
@@ -216,6 +220,10 @@ typedef struct proxystate {
     SSL *ssl;             /* OpenSSL SSL state */
 
     struct sockaddr_storage remote_ip;  /* Remote ip returned from `accept` */
+
+    // ibc
+    char* pems_ptr;       /* Pointer to the client's certificate + chain in PEM */
+    int pems_len;
 } proxystate;
 
 #define LOG(...)                                        \
@@ -588,6 +596,16 @@ RSA *load_rsa_privatekey(SSL_CTX *ctx, const char *file) {
     return rsa;
 }
 
+// ibc
+/* When --write-pems is enabled we need this callback to handle the client given
+ * certificate chain (if present) and always return 1 (since we are not validating
+ * such a certificate chain).
+ */
+static int verify_callback(int preverify_ok, X509_STORE_CTX *ctx)
+{
+  return 1;
+}
+
 /* Init library and load specified certificate.
  * Establishes a SSL_ctx, to act as a template for
  * each connection */
@@ -613,6 +631,14 @@ static SSL_CTX * init_openssl() {
 
     SSL_CTX_set_options(ctx, ssloptions);
     SSL_CTX_set_info_callback(ctx, info_callback);
+
+    // ibc
+    /* When --write-pems is set certificate must be requested to the client
+     * (if not, the client will not send it according to TLS/SSL protocol) */
+    if (OPTIONS.WRITE_PEMS) {
+      SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, verify_callback);
+      SSL_CTX_set_verify_depth(ctx, 4);
+    }
 
     if (SSL_CTX_use_certificate_chain_file(ctx, OPTIONS.CERT_FILE) <= 0) {
         ERR_print_errors_fp(stderr);
@@ -802,6 +828,11 @@ static void shutdown_proxy(proxystate *ps, SHUTDOWN_REQUESTOR req) {
 
         close(ps->fd_up);
         close(ps->fd_down);
+
+        // ibc
+        if (OPTIONS.WRITE_PEMS)
+          if (ps->pems_ptr)
+            free(ps->pems_ptr);
 
         SSL_set_shutdown(ps->ssl, SSL_SENT_SHUTDOWN);
         SSL_free(ps->ssl);
@@ -1009,9 +1040,79 @@ static void client_handshake(struct ev_loop *loop, ev_io *w, int revents) {
     (void) revents;
     int t;
     proxystate *ps = (proxystate *)w->data;
+    // ibc
+    X509 *X509_cert;
+    STACK_OF(X509) *X509_chain;
+    unsigned char pem_string[PEM_MAX_SIZE];
+    int pem_len, pem_len_size;
+    size_t written = 0;
+    char tmp_string[20];
+    BIO *bio;
+    int i;
 
     t = SSL_do_handshake(ps->ssl);
     if (t == 1) {
+        // ibc
+        if (OPTIONS.WRITE_PEMS) {
+          if ((X509_cert = SSL_get_peer_certificate(ps->ssl))) {
+            bio = BIO_new (BIO_s_mem());
+            assert(bio != NULL);
+            PEM_write_bio_X509(bio, X509_cert);
+            X509_free(X509_cert);
+            pem_len = BIO_read(bio, pem_string, PEM_MAX_SIZE);
+            BIO_free(bio);
+            pem_len_size = sprintf(tmp_string, "%d", pem_len);
+            /* Write PEM size + CRLF + PEM */
+            ps->pems_ptr = (char*)malloc(pem_len_size + 2 + (sizeof(char)*pem_len));
+            sprintf(ps->pems_ptr, "%d", pem_len);
+            memcpy(ps->pems_ptr + pem_len_size, "\r\n", 2);
+            memcpy(ps->pems_ptr + pem_len_size + 2, pem_string, pem_len);
+            ps->pems_len = pem_len_size + 2 + pem_len;
+
+            if ((X509_chain = SSL_get_peer_cert_chain(ps->ssl))) {
+              if (sk_X509_num(X509_chain) > 0) {
+                for (i = 0; i < sk_X509_num(X509_chain); i++) {
+                  bio = BIO_new (BIO_s_mem());
+                  assert(bio != NULL);
+                  PEM_write_bio_X509(bio, sk_X509_value(X509_chain, i));
+                  pem_len = BIO_read(bio, pem_string, PEM_MAX_SIZE);
+                  BIO_free(bio);
+                  pem_len_size = sprintf(tmp_string, "%d", pem_len);
+                  /* Apppend PEM size + CRLF + PEM */
+                  ps->pems_ptr = realloc(ps->pems_ptr, ps->pems_len + pem_len_size + 2 + pem_len);
+                  sprintf(ps->pems_ptr + ps->pems_len, "%d", pem_len);
+                  memcpy(ps->pems_ptr + ps->pems_len + pem_len_size, "\r\n", 2);
+                  memcpy(ps->pems_ptr + ps->pems_len + pem_len_size + 2, pem_string, pem_len);
+                  ps->pems_len += pem_len_size + 2 + pem_len;
+                }
+              }
+              //sk_X509_free(X509_chain); // TODO: Peta al hacer SSL_free(ps->ssl), ¿igual no hace falta? claro que si joder!
+            }
+          }
+          else {
+            ps->pems_ptr = NULL;
+            ps->pems_len = 0;
+            printf("ibc: no certificate presented by client\n");
+          }
+
+          // ibc
+          char *ring_pnt = ringbuffer_write_ptr(&ps->ring_down);
+          if (ps->pems_ptr) {
+            //ps->pems_ptr = realloc(ps->pems_ptr, ps->pems_len + 1);
+            //ps->pems_ptr[ps->pems_len] = '\0';
+            //printf("ibc: certificate + chain (length = %d):\n%s_END_\n", ps->pems_len, ps->pems_ptr);
+
+            memcpy(ring_pnt, ps->pems_ptr, ps->pems_len);
+            memcpy(ring_pnt + ps->pems_len, "\r\n", 2);
+            ringbuffer_write_append(&ps->ring_down, ps->pems_len + 2);
+          }
+          else {
+            memcpy(ring_pnt, "\r\n", 2);
+            ringbuffer_write_append(&ps->ring_down, ps->pems_len + 2);
+          }
+          ev_io_start(loop, &ps->ev_w_down);
+        }
+
         end_handshake(ps);
     }
     else {
@@ -1313,6 +1414,8 @@ static void usage_fail(const char *prog, const char *msg) {
 "                           to backend before the actual data\n"
 "  --write-proxy            write HaProxy's PROXY (IPv4 or IPv6) protocol line\n" 
 "                           before actual data\n"
+// ibc
+"  --write-pems             write client's given certificate and chain in PEM format\n"
 );
     exit(1);
 }
@@ -1441,6 +1544,7 @@ static void parse_cli(int argc, char **argv) {
         {"ssl", 0, &ssl, 1},
         {"write-ip", 0, &OPTIONS.WRITE_IP_OCTET, 1},
         {"write-proxy", 0, &OPTIONS.WRITE_PROXY_LINE, 1},
+        {"write-pems", 0, &OPTIONS.WRITE_PEMS, 1},
         {"daemon", 0, &OPTIONS.DAEMONIZE, 1},
         {0, 0, 0, 0}
     };
